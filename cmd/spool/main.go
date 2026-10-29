@@ -1,9 +1,10 @@
-// Command spool is the spool module's program: a door that posts each request
-// dropped as a file in the inbox to the Hive's lead, as a thread of its own,
-// and writes what comes of that thread to the outbox, one file per request.
+// Command spool is the spool module's program: a door that posts each line the
+// relay appends to the inbox file to the Hive's lead (a reply in its parent's
+// thread), and appends what comes of that thread to the outbox file as answer
+// and delivered lines.
 //
 //	spool         the module's program, as the daemon runs it
-//	spool where   print where spool.json goes and the folders it names
+//	spool where   print where spool.json goes and the files it names
 package main
 
 import (
@@ -73,7 +74,7 @@ func main() {
 		case <-time.After(10 * time.Second):
 		}
 	}
-	h.Report(ctx, map[string]any{"kind": "watching", "text": fmt.Sprintf("spool: taking requests from %s, answering in %s", cfg.Inbox, cfg.Outbox), "inbox": cfg.Inbox, "outbox": cfg.Outbox})
+	h.Report(ctx, map[string]any{"kind": "watching", "text": fmt.Sprintf("spool: reading %s, answering in %s", cfg.Inbox, cfg.Outbox), "inbox": cfg.Inbox, "outbox": cfg.Outbox})
 	if err := d.Run(ctx); err != nil && ctx.Err() == nil {
 		fail(err)
 	}

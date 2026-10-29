@@ -110,7 +110,7 @@ type spoolT struct {
 
 func newSpool(t *testing.T) *spoolT {
 	dir := t.TempDir()
-	s := &spoolT{t: t, hive: newFakeHive(t), home: filepath.Join(dir, "home"), cfg: Config{Inbox: filepath.Join(dir, "inbox"), Outbox: filepath.Join(dir, "outbox")}}
+	s := &spoolT{t: t, hive: newFakeHive(t), home: filepath.Join(dir, "home"), cfg: Config{Inbox: filepath.Join(dir, "hive-shadow", "inbox"), Outbox: filepath.Join(dir, "hive-shadow", "outbox")}}
 	os.MkdirAll(s.home, 0o700)
 	// Something already in the journal before the module starts: never the spool's.
 	s.hive.reply("lead", "old", "lead-1", "history")
@@ -120,16 +120,34 @@ func newSpool(t *testing.T) *spoolT {
 
 func (s *spoolT) restart() {
 	s.door = New(s.cfg, &hive.Client{API: s.hive.srv.URL, Token: "tok"}, "spool", s.home)
-	s.door.Settle = 0
 	if err := s.door.Start(context.Background()); err != nil {
 		s.t.Fatal(err)
 	}
 }
 
-func (s *spoolT) drop(name, body string) {
-	if err := os.WriteFile(filepath.Join(s.cfg.Inbox, name), []byte(body), 0o644); err != nil {
+// write appends raw to the inbox as the relay does, newline and all.
+func (s *spoolT) write(raw string) {
+	s.t.Helper()
+	f, err := os.OpenFile(s.cfg.Inbox, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
 		s.t.Fatal(err)
 	}
+	defer f.Close()
+	if _, err := f.WriteString(raw); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// ask appends a top-level message (thread "") or a reply as one whole line.
+func (s *spoolT) ask(ts, thread, text string) string {
+	id := "C0AAAAAAAAA/" + ts
+	var th any
+	if thread != "" {
+		th = thread
+	}
+	raw, _ := json.Marshal(map[string]any{"id": id, "channel": "C0AAAAAAAAA", "thread": th, "user": "U0BBBBBBBBB", "text": text, "posted": 1793300000.5, "heard": 1793300042.5})
+	s.write(string(raw) + "\n")
+	return id
 }
 
 func (s *spoolT) step() {
@@ -139,76 +157,152 @@ func (s *spoolT) step() {
 	}
 }
 
-func (s *spoolT) out(id string) Request {
+// out reads the outbox's lines, each checked whole.
+func (s *spoolT) out() []Out {
 	s.t.Helper()
-	raw, err := os.ReadFile(filepath.Join(s.cfg.Outbox, id+".json"))
+	raw, err := os.ReadFile(s.cfg.Outbox)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
 		s.t.Fatal(err)
 	}
-	var r Request
-	if err := json.Unmarshal(raw, &r); err != nil {
-		s.t.Fatalf("outbox %s: %v\n%s", id, err, raw)
+	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+		s.t.Fatalf("outbox ends in a partial line: %q", raw)
+	}
+	var outs []Out
+	for _, l := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
+		if l == "" {
+			continue
+		}
+		var o Out
+		if err := json.Unmarshal([]byte(l), &o); err != nil {
+			s.t.Fatalf("outbox line %q: %v", l, err)
+		}
+		outs = append(outs, o)
+	}
+	return outs
+}
+
+func (s *spoolT) req(id string) *Request {
+	s.t.Helper()
+	r := s.door.State().Requests[id]
+	if r == nil {
+		s.t.Fatalf("no request %s", id)
 	}
 	return r
 }
 
-func exists(path string) bool { _, err := os.Stat(path); return err == nil }
+// The two lines autobox gave as the relay's own (chat 261029-224842-e2d6677df4).
+const (
+	sampleTop   = `{"id": "C0AAAAAAAAA/1793300000.123456", "channel": "C0AAAAAAAAA", "thread": null, "user": "U0BBBBBBBBB", "text": "can you update the sizing sheet for the north site", "posted": 1793300000.123456, "heard": 1793300042.51}`
+	sampleReply = `{"id": "C0AAAAAAAAA/1793300120.000200", "channel": "C0AAAAAAAAA", "thread": "1793300000.123456", "user": "U0CCCCCCCCC", "text": "<@U0BBBBBBBBB> use the October numbers", "posted": 1793300120.0002, "heard": 1793300162.9}`
+)
 
-func TestRequestPostsOnceToTheLeadAndMovesToTaken(t *testing.T) {
+func TestTopLevelStartsAThreadAndAReplyJoinsIt(t *testing.T) {
 	s := newSpool(t)
-	s.drop("r-001.json", `{"id": "req-1", "text": "Add a dark mode to the dashboard.", "from": "workspace"}`)
+	s.write(sampleTop + "\n" + sampleReply + "\n")
 	s.step()
 	posts := s.hive.sent()
-	if len(posts) != 1 || posts[0].Chat != "lead" || posts[0].Thread != posts[0].ID {
-		t.Fatalf("want one post starting its own thread in the lead's chat, got %+v", posts)
+	if len(posts) != 2 || posts[0].Chat != "lead" || posts[0].Thread != posts[0].ID {
+		t.Fatalf("want a new thread in the lead's chat and the reply in it, got %+v", posts)
 	}
-	if !strings.Contains(posts[0].Text, "Add a dark mode to the dashboard.") || !strings.Contains(posts[0].Text, "from: workspace") || !strings.Contains(posts[0].Text, "req-1") {
+	if !strings.Contains(posts[0].Text, "can you update the sizing sheet for the north site") || !strings.Contains(posts[0].Text, "C0AAAAAAAAA/1793300000.123456") || !strings.Contains(posts[0].Text, "U0BBBBBBBBB") {
 		t.Errorf("post doesn't carry the request: %q", posts[0].Text)
 	}
-	if exists(filepath.Join(s.cfg.Inbox, "r-001.json")) || !exists(filepath.Join(s.cfg.Inbox, "taken", "r-001.json")) {
-		t.Error("the file should be moved to inbox/taken/")
+	if posts[1].Chat != "lead" || posts[1].Thread != posts[0].Thread || !strings.Contains(posts[1].Text, "<@U0BBBBBBBBB> use the October numbers") {
+		t.Errorf("the reply belongs in its parent's thread: %+v", posts[1])
 	}
-	r := s.out("req-1")
-	if r.Status != "open" || r.Chat != "lead" || r.Thread != posts[0].Thread || r.File != "r-001.json" || string(r.Input) == "" {
-		t.Errorf("outbox: %+v", r)
+	r := s.req("C0AAAAAAAAA/1793300000.123456")
+	if r.Status != "open" || r.Chat != "lead" || r.Thread != posts[0].Thread || len(r.Lines) != 2 || len(r.Replies) != 0 {
+		t.Errorf("request: %+v", r)
 	}
-	if len(r.Replies) != 0 {
-		t.Errorf("the spool's own post or the history is not a reply: %+v", r.Replies)
+	if len(s.out()) != 0 {
+		t.Errorf("nothing to answer yet: %+v", s.out())
+	}
+	info, _ := os.Stat(s.cfg.Inbox)
+	if st := s.door.State(); st.Inbox != info.Size() {
+		t.Errorf("offset %d, inbox %d bytes", st.Inbox, info.Size())
 	}
 
-	// Steps after, a restart, and the same file dropped again: still one post.
+	// Steps after, a restart, and the same line sent again: still once each.
 	s.step()
 	s.restart()
-	s.drop("r-001.json", `{"id": "req-1", "text": "Add a dark mode to the dashboard."}`)
+	s.write(sampleTop + "\n")
 	s.step()
-	if n := len(s.hive.sent()); n != 1 {
-		t.Fatalf("posted %d times, want once", n)
+	if n := len(s.hive.sent()); n != 2 {
+		t.Fatalf("posted %d times, want twice", n)
 	}
-	if !exists(filepath.Join(s.cfg.Inbox, "taken", "r-001.2.json")) {
-		t.Error("the repeat should be moved beside the first")
+	if _, err := os.Stat(s.cfg.Inbox); err != nil {
+		t.Fatal("the inbox is never moved:", err)
 	}
 }
 
-func TestProjectRequestGoesToItsLead(t *testing.T) {
+func TestPartialLineWaits(t *testing.T) {
 	s := newSpool(t)
-	s.drop("a.json", `{"project": "hive", "prompt": "Fix the flaky test."}`)
-	s.drop("b.json", `{"project": "nowhere", "prompt": "Something."}`)
+	s.write(sampleTop[:40])
+	s.step()
+	if len(s.hive.sent()) != 0 || s.door.State().Inbox != 0 {
+		t.Fatal("took half a line")
+	}
+	s.write(sampleTop[40:])
+	s.restart()
+	s.step()
+	if len(s.hive.sent()) != 0 {
+		t.Fatal("took a line with no newline yet")
+	}
+	s.write("\n" + sampleReply[:30])
+	s.step()
+	if p := s.hive.sent(); len(p) != 1 || !strings.Contains(p[0].Text, "north site") {
+		t.Fatalf("posts: %+v", p)
+	}
+	s.write(sampleReply[30:] + "\n")
+	s.step()
+	if p := s.hive.sent(); len(p) != 2 || p[1].Thread != p[0].Thread {
+		t.Fatalf("the reply, once whole, goes in its parent's thread: %+v", p)
+	}
+}
+
+func TestReplyToAThreadNotSeenStartsItsOwn(t *testing.T) {
+	s := newSpool(t)
+	s.write(sampleReply + "\n")
+	id2 := s.ask("1793300300.000300", "1793300000.123456", "and the south site")
+	s.step()
+	posts := s.hive.sent()
+	if len(posts) != 2 || posts[1].Thread != posts[0].Thread {
+		t.Fatalf("posts: %+v", posts)
+	}
+	r := s.req("C0AAAAAAAAA/1793300120.000200")
+	if r.SlackThread != "1793300000.123456" || len(r.Lines) != 2 || r.Lines[1] != id2 {
+		t.Fatalf("request: %+v", r)
+	}
+	s.hive.reply("lead", posts[0].Thread, "lead-1", "Updated.")
+	s.step()
+	if o := s.out(); len(o) != 1 || o[0].Request != "C0AAAAAAAAA/1793300120.000200" {
+		t.Fatalf("an answer names an id the relay sent: %+v", o)
+	}
+}
+
+func TestProjectLineGoesToItsLead(t *testing.T) {
+	s := newSpool(t)
+	s.write(`{"id": "C1/1.0", "channel": "C1", "thread": null, "user": "U1", "text": "Fix the flaky test.", "project": "hive"}` + "\n")
+	s.write(`{"id": "C1/2.0", "channel": "C1", "thread": null, "user": "U1", "text": "Something.", "project": "nowhere"}` + "\n")
 	s.step()
 	posts := s.hive.sent()
 	if len(posts) != 2 {
 		t.Fatalf("posts: %+v", posts)
 	}
-	if posts[0].Chat != "project:hive" || s.out("a").Chat != "project:hive" || s.out("a").Project != "hive" {
-		t.Errorf("a named project hive: %+v", posts[0])
+	if posts[0].Chat != "project:hive" || s.req("C1/1.0").Chat != "project:hive" {
+		t.Errorf("a line naming project hive: %+v", posts[0])
 	}
-	if posts[1].Chat != "lead" || !strings.Contains(posts[1].Text, "nowhere") || s.out("b").Chat != "lead" {
+	if posts[1].Chat != "lead" || !strings.Contains(posts[1].Text, "nowhere") || s.req("C1/2.0").Chat != "lead" {
 		t.Errorf("an unknown project goes to the lead, saying so: %+v", posts[1])
 	}
 }
 
-func TestRepliesTasksAndMergesComeBackAndItIsDoneWhenTheTasksAre(t *testing.T) {
+func TestAnswersAndDeliveredComeBackAndItIsDoneWhenTheTasksAre(t *testing.T) {
 	s := newSpool(t)
-	s.drop("ask.txt", "Make the score page load faster.\n")
+	id := s.ask("1793300000.000001", "", "Make the score page load faster.")
 	s.step()
 	th := s.hive.sent()[0].Thread
 	s.hive.reply("lead", th, "lead-1", "On it: filing two tasks.")
@@ -217,9 +311,11 @@ func TestRepliesTasksAndMergesComeBackAndItIsDoneWhenTheTasksAre(t *testing.T) {
 	s.hive.task("t9", "lead", "other-thread", "new", nil)
 	s.hive.reply("lead", "other-thread", "lead-1", "not this one")
 	s.step()
-	r := s.out("ask")
-	if r.Status != "open" || len(r.Tasks) != 2 || r.Tasks[0].ID != "t1" || r.Tasks[1].Stage != "queued" || r.Final != "On it: filing two tasks." || len(r.Replies) != 1 {
-		t.Fatalf("outbox after filing: %+v", r)
+	if o := s.out(); len(o) != 1 || o[0] != (Out{Kind: "answer", Request: id, Text: "On it: filing two tasks."}) {
+		t.Fatalf("outbox after filing: %+v", o)
+	}
+	if r := s.req(id); r.Status != "open" || len(r.Tasks) != 2 || r.Tasks[1].Stage != "queued" {
+		t.Fatalf("request after filing: %+v", r)
 	}
 
 	pr := map[string]any{"number": 42, "url": "https://github.com/o/hive/pull/42", "state": "MERGED", "head_sha": "aaaa1111"}
@@ -227,139 +323,167 @@ func TestRepliesTasksAndMergesComeBackAndItIsDoneWhenTheTasksAre(t *testing.T) {
 	s.hive.reply("lead", th, "hive", "Merged: task t1 https://github.com/o/hive/pull/42")
 	s.hive.task("t1", "lead", th, "done", map[string]any{"pr": pr, "sha": "aaaa1111", "merge_sha": "mmmm2222"})
 	s.step()
-	r = s.out("ask")
-	if r.Status != "open" {
+	o := s.out()
+	if len(o) != 2 || o[1].Kind != "delivered" || o[1].Request != id {
+		t.Fatalf("one delivered line for the merge, none for the Hive's note: %+v", o)
+	}
+	for _, want := range []string{"https://github.com/o/hive/pull/42", "aaaa1111", "mmmm2222"} {
+		if !strings.Contains(o[1].Text, want) {
+			t.Errorf("delivered %q lacks %s", o[1].Text, want)
+		}
+	}
+	if r := s.req(id); r.Status != "open" || len(r.Merged) != 1 {
 		t.Fatalf("t2 is still queued, so not done: %+v", r)
-	}
-	if len(r.Merged) != 1 || r.Merged[0].URL != "https://github.com/o/hive/pull/42" || r.Merged[0].HeadSHA != "aaaa1111" || r.Merged[0].MergeSHA != "mmmm2222" || r.Merged[0].PR != 42 {
-		t.Fatalf("merged: %+v", r.Merged)
-	}
-	if r.Final != "On it: filing two tasks." || len(r.Replies) != 2 {
-		t.Errorf("the Hive's note is a reply but not the lead's final word: %+v", r)
 	}
 
 	s.hive.task("t2", "lead", th, "stopped", map[string]any{"reason": "not needed"})
 	s.hive.reply("lead", th, "lead-1", "Done: the page loads in 200 ms now.")
 	s.step()
-	r = s.out("ask")
-	if r.Status != "done" || r.DoneBy != "tasks" || r.Done == nil || r.Final != "Done: the page loads in 200 ms now." || r.Tasks[1].Reason != "not needed" {
+	if r := s.req(id); r.Status != "done" || r.DoneBy != "tasks" || r.Done == nil {
 		t.Fatalf("every task done or stopped: %+v", r)
+	}
+	if o := s.out(); len(o) != 3 || o[2].Text != "Done: the page loads in 200 ms now." {
+		t.Fatalf("outbox: %+v", o)
 	}
 
 	// A task filed later opens it again.
 	s.hive.task("t3", "lead", th, "new", nil)
 	s.step()
-	if r = s.out("ask"); r.Status != "open" || r.Done != nil {
+	if r := s.req(id); r.Status != "open" || r.Done != nil {
 		t.Fatalf("a new task should open it again: %+v", r)
+	}
+	if len(s.out()) != 3 {
+		t.Fatal("a task's stage is no outbox line")
 	}
 }
 
 func TestBlockedTaskKeepsItOpen(t *testing.T) {
 	s := newSpool(t)
-	s.drop("x.txt", "Do a thing.")
+	id := s.ask("1.1", "", "Do a thing.")
 	s.step()
-	th := s.hive.sent()[0].Thread
-	s.hive.task("t1", "lead", th, "blocked", nil)
+	s.hive.task("t1", "lead", s.hive.sent()[0].Thread, "blocked", nil)
 	s.step()
-	if r := s.out("x"); r.Status != "open" {
+	if r := s.req(id); r.Status != "open" {
 		t.Fatalf("blocked is neither done nor stopped: %+v", r)
 	}
 }
 
 func TestLeadSaysItNeedsNothing(t *testing.T) {
 	s := newSpool(t)
-	s.drop("q.md", "What version is main on?")
+	id := s.ask("1.2", "", "What version is main on?")
 	s.step()
 	th := s.hive.sent()[0].Thread
 	s.hive.reply("lead", th, "lead-1", "Main is on v0.1.150.")
 	s.step()
-	if r := s.out("q"); r.Status != "open" {
+	if r := s.req(id); r.Status != "open" {
 		t.Fatalf("a reply alone isn't done: %+v", r)
 	}
-	s.hive.reply("lead", th, "lead-1", "Main is on v0.1.150.\nspool: done")
+	s.hive.reply("lead", th, "lead-1", "It was tagged today.\nspool: done")
+	s.hive.reply("lead", th, "lead-1", "spool: done")
 	s.step()
-	r := s.out("q")
-	if r.Status != "done" || r.DoneBy != "lead" || len(r.Tasks) != 0 || !strings.HasPrefix(r.Final, "Main is on") {
+	if r := s.req(id); r.Status != "done" || r.DoneBy != "lead" {
 		t.Fatalf("the lead said spool: done: %+v", r)
+	}
+	o := s.out()
+	if len(o) != 2 || o[1].Text != "It was tagged today." {
+		t.Fatalf("spool: done is for the spool, not an answer: %+v", o)
 	}
 }
 
 func TestJoinedAskCounts(t *testing.T) {
 	s := newSpool(t)
-	s.drop("j.txt", "Speed up the build.")
+	id := s.ask("1.3", "", "Speed up the build.")
 	s.step()
 	th := s.hive.sent()[0].Thread
 	s.hive.task("big", "lead", "elsewhere", "working", map[string]any{"joins": []map[string]any{{"from": "lead-1", "chat": "lead", "thread": th}}})
 	s.step()
-	if r := s.out("j"); len(r.Tasks) != 1 || r.Tasks[0].ID != "big" {
+	if r := s.req(id); len(r.Tasks) != 1 || r.Tasks[0].ID != "big" {
 		t.Fatalf("a task the thread's ask joined is the thread's: %+v", r.Tasks)
 	}
 }
 
-func TestEmptyFileIsRefusedAndNotPosted(t *testing.T) {
+func TestEmptyAndBadLinesAreNotPosted(t *testing.T) {
 	s := newSpool(t)
-	s.drop("empty.json", `{"id": "e1", "text": ""}`)
+	s.write("not json\n\n{\"text\": \"no id\"}\n")
+	id := s.ask("1.4", "", "  ")
 	s.step()
 	if len(s.hive.sent()) != 0 {
-		t.Fatal("posted an empty request")
+		t.Fatal("posted a line with no request")
 	}
-	if r := s.out("e1"); r.Status != "refused" || r.Error == "" {
-		t.Fatalf("outbox: %+v", r)
+	if r := s.req(id); r.Status != "refused" || r.Error == "" {
+		t.Fatalf("request: %+v", r)
+	}
+	s.ask("1.5", "", "A real one.")
+	s.step()
+	if len(s.hive.sent()) != 1 {
+		t.Fatal("the lines after a bad one are still read")
 	}
 }
 
-func TestUnsettledAndHiddenFilesWait(t *testing.T) {
-	s := newSpool(t)
-	s.door.Settle = time.Hour
-	s.drop("new.txt", "Still being written")
-	s.drop(".hidden", "x")
-	s.drop("part.tmp", "x")
-	s.step()
-	if len(s.hive.sent()) != 0 || !exists(filepath.Join(s.cfg.Inbox, "new.txt")) {
-		t.Fatal("took a file before it settled")
-	}
-	s.door.Settle = 0
-	s.step()
-	if len(s.hive.sent()) != 1 || !exists(filepath.Join(s.cfg.Inbox, ".hidden")) || !exists(filepath.Join(s.cfg.Inbox, "part.tmp")) {
-		t.Fatalf("posts: %+v", s.hive.sent())
-	}
-}
-
-func TestHiveDownLeavesTheFileForLater(t *testing.T) {
+func TestHiveDownLeavesTheLineForLater(t *testing.T) {
 	s := newSpool(t)
 	s.door.Hive.Token = "wrong"
-	s.drop("later.txt", "Do it later.")
+	id := s.ask("1.6", "", "Do it later.")
 	if err := s.door.Step(context.Background()); err == nil {
 		t.Fatal("want an error when the post fails")
 	}
-	if !exists(filepath.Join(s.cfg.Inbox, "later.txt")) {
-		t.Fatal("a file that wasn't posted must stay in the inbox")
+	if s.door.State().Inbox != 0 {
+		t.Fatal("a line that wasn't posted must not be read past")
 	}
 	s.door.Hive.Token = "tok"
 	s.step()
-	if len(s.hive.sent()) != 1 || s.out("later").Status != "open" {
+	if len(s.hive.sent()) != 1 || s.req(id).Status != "open" {
 		t.Fatal("posted once the Hive answers")
 	}
 }
 
-func TestParse(t *testing.T) {
-	for _, c := range []struct {
-		name, raw, id, project, text string
-	}{
-		{"a.txt", "  hello\n", "a", "", "hello"},
-		{"b.json", `{"id": 17, "request": "do x"}`, "17", "", "do x"},
-		{"c.json", `{"project": "hive", "ask": "do y", "priority": 2, "tags": ["a"]}`, "c", "hive", "do y\npriority: 2\ntags: [\"a\"]"},
-		{"d.json", `{"title": "only a title"}`, "d", "", "title: only a title"},
-		{"e.json", `not json {`, "e", "", "not json {"},
-		{"noext", `x`, "noext", "", "x"},
-	} {
-		q := Parse(c.name, []byte(c.raw))
-		if q.ID != c.id || q.Project != c.project || q.Text != c.text {
-			t.Errorf("%s: got %+v", c.name, q)
-		}
+func TestInboxCutShortIsReadAgainWithoutRepeats(t *testing.T) {
+	s := newSpool(t)
+	s.ask("2.1", "", "first")
+	s.ask("2.2", "", "second")
+	s.step()
+	os.Remove(s.cfg.Inbox)
+	s.ask("2.2", "", "second")
+	s.ask("2.3", "", "third")
+	s.step()
+	if p := s.hive.sent(); len(p) != 3 || !strings.Contains(p[2].Text, "third") {
+		t.Fatalf("posts: %+v", p)
 	}
-	if FileID("a/../b c") != "a-..-b-c" || FileID("..") != "request" {
-		t.Errorf("FileID: %q %q", FileID("a/../b c"), FileID(".."))
+}
+
+func TestOutboxWriteCutShortIsFinishedNotRepeated(t *testing.T) {
+	s := newSpool(t)
+	s.write("") // the relay's file
+	os.WriteFile(s.cfg.Outbox, []byte(`{"kind":"answer","request":"x","text":"before"}`+"\n"), 0o644)
+	at := int64(len(`{"kind":"answer","request":"x","text":"before"}` + "\n"))
+	// A crash mid-write: the mark saved, half the batch written.
+	s.door.st.Out = []Out{{Kind: "answer", Request: "a", Text: "one"}, {Kind: "delivered", Request: "a", Text: "two"}}
+	s.door.st.OutAt = &at
+	f, _ := os.OpenFile(s.cfg.Outbox, os.O_WRONLY|os.O_APPEND, 0o644)
+	f.WriteString(`{"kind":"answer","request":"a","text":"one"}` + "\n" + `{"kind":"deliv`)
+	f.Close()
+	s.step()
+	o := s.out()
+	if len(o) != 3 || o[1].Text != "one" || o[2].Text != "two" {
+		t.Fatalf("outbox: %+v", o)
+	}
+	if st := s.door.State(); len(st.Out) != 0 || st.OutAt != nil {
+		t.Fatalf("state: %+v", st)
+	}
+}
+
+func TestParseLine(t *testing.T) {
+	l, err := ParseLine([]byte(sampleReply))
+	if err != nil || l.ID != "C0AAAAAAAAA/1793300120.000200" || l.Thread != "1793300000.123456" || l.User != "U0CCCCCCCCC" || l.Text != "<@U0BBBBBBBBB> use the October numbers" || l.slackKey() != "C0AAAAAAAAA/1793300000.123456" {
+		t.Fatalf("reply: %+v %v", l, err)
+	}
+	if l, err = ParseLine([]byte(sampleTop)); err != nil || l.Thread != "" || l.slackKey() != l.ID {
+		t.Fatalf("top: %+v %v", l, err)
+	}
+	for _, bad := range []string{"x", `{"text": "t"}`, `[1]`} {
+		if _, err := ParseLine([]byte(bad)); err == nil {
+			t.Errorf("%s: want an error", bad)
+		}
 	}
 }
 
@@ -375,6 +499,6 @@ func TestLoadConfig(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(dir, "spool.json"), []byte(`{"inbox": "rel"}`), 0o600)
 	if _, err = LoadConfig(filepath.Join(dir, "spool.json")); err == nil {
-		t.Fatal("a relative folder should be refused")
+		t.Fatal("a relative path should be refused")
 	}
 }
