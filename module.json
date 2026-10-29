@@ -1,0 +1,8 @@
+{
+  "name": "spool",
+  "description": "A spool folder as a door to the Hive: a request dropped as a file in the inbox (~/hive-shadow/inbox by default) is posted once to the lead's chat, or to the lead of the project it names, as a thread of its own, and the file moves to inbox/taken/. What comes of that thread is written to outbox/<id>.json as it happens: the lead's replies, the tasks filed from it with their stages, and each merged pull request's URL, head SHA and merge SHA. The file says done once every task the thread filed is done or stopped, or the lead says `spool: done`. For a system outside the Hive's network namespace that can't reach its API. The folders are named in spool.json in the module's own HOME; docs/README.md gives both file formats. `run` builds it once with the Go on PATH or the Hive's own (GOTOOLCHAIN=local, GOPROXY=off: nothing fetched).",
+  "exec": ["./run"],
+  "hooks": ["channel"],
+  "command": true,
+  "projects": ["*"]
+}
