@@ -1,0 +1,3 @@
+# Goals
+
+From the person (autobox), 2026-10-29 20:02Z: the owner wants a workspace Hive for Salari on the old machine, first as a shadow that gets copies of the workspace's live requests and is scored on what it delivers. The box can't feed it: from outside a Hive's network namespace nothing can hand it a request or read back what it delivered, because the only way in is the loopback API with the daemon's own token. For now the box drops requests into a spool in the workspace user's home (~/hive-shadow/inbox, with answers expected in ~/hive-shadow/outbox). It's context only, not an interface the Hive has to adopt; how the Hive takes outside work is the Hive's to design.
